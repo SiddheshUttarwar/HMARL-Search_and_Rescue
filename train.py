@@ -20,8 +20,8 @@ def train(cfg: Config):
     agent = HierarchicalMARLAgent(cfg)
 
     print("=" * 60)
-    print("  Hierarchical MARL Training")
-    print(f"  Agents: {cfg.n_agents}  |  Grid: {cfg.grid_width}x{cfg.grid_height}")
+    print("  Hierarchical MARL Training (Actor-Critic)")
+    print(f"  Agents: {cfg.n_agents}  |  Grid: {cfg.grid_width}x{cfg.grid_height}  |  Obstacles: {cfg.n_obstacles}")
     print(f"  Victims: {cfg.n_victims}  |  Episodes: {cfg.train_episodes}")
     print("=" * 60)
 

@@ -37,10 +37,9 @@ class Config:
     hidden_dim: int = 64
     action_dim: int = 5               # {up, down, left, right, stay}
 
-    # ── PPO ──────────────────────────────────────────────────────
+    # ── Actor-Critic ─────────────────────────────────────────────
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.2
     entropy_coef: float = 0.01
     value_loss_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -48,7 +47,6 @@ class Config:
     lr_critic: float = 1e-3
     lr_manager: float = 3e-4
     lr_termination: float = 3e-4
-    ppo_epochs: int = 4
     mini_batch_size: int = 64
 
     # ── Reward shaping ───────────────────────────────────────────

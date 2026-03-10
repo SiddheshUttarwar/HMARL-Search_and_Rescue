@@ -24,28 +24,77 @@ class SAREnvironment:
         self.cfg = cfg
         self.rng = np.random.RandomState(seed)
         self.belief = BeliefMap(cfg.grid_width, cfg.grid_height, cfg.n_victims)
+        
+        # ── Generate fixed obstacles for this environment ────────────
+        self.obstacles = np.zeros((cfg.grid_height, cfg.grid_width), dtype=bool)
+        self._generate_obstacles()
+        self.walkable_cells = (cfg.grid_width * cfg.grid_height) - cfg.n_obstacles
+        self.belief.set_obstacles(self.obstacles)
+        
         # State variables (set in reset)
         self.agent_pos: np.ndarray | None = None
         self.victim_pos: np.ndarray | None = None
         self.victims_found: np.ndarray | None = None
         self.step_count: int = 0
 
+    # ── Obstacles ────────────────────────────────────────────────
+    def _generate_obstacles(self):
+        """Generate connected wall segments for realistic terrain."""
+        cfg = self.cfg
+        placed = 0
+        seeds = 4 + self.rng.randint(0, 4)
+        for _ in range(seeds):
+            if placed >= cfg.n_obstacles: break
+            sx = 2 + self.rng.randint(0, cfg.grid_width - 4)
+            sy = 2 + self.rng.randint(0, cfg.grid_height - 4)
+            length = 3 + self.rng.randint(0, 6)
+            horizontal = self.rng.rand() < 0.5
+            for k in range(length):
+                if placed >= cfg.n_obstacles: break
+                wx = sx + k if horizontal else sx
+                wy = sy if horizontal else sy + k
+                if 0 <= wx < cfg.grid_width and 0 <= wy < cfg.grid_height:
+                    if not self.obstacles[wy, wx]:
+                        self.obstacles[wy, wx] = True
+                        placed += 1
+                # Branching
+                if self.rng.rand() < 0.3 and placed < cfg.n_obstacles:
+                    bx = wx + (0 if horizontal else (1 if self.rng.rand() < 0.5 else -1))
+                    by = wy + ((1 if self.rng.rand() < 0.5 else -1) if horizontal else 0)
+                    if 0 <= bx < cfg.grid_width and 0 <= by < cfg.grid_height:
+                        if not self.obstacles[by, bx]:
+                            self.obstacles[by, bx] = True
+                            placed += 1
+                            
+        # Fill remaining
+        while placed < cfg.n_obstacles:
+            rx = self.rng.randint(0, cfg.grid_width)
+            ry = self.rng.randint(0, cfg.grid_height)
+            if not self.obstacles[ry, rx]:
+                self.obstacles[ry, rx] = True
+                placed += 1
+
     # ── Reset (random episode generation) ────────────────────────
     def reset(self) -> np.ndarray:
         """Generate a fresh random episode and return initial observations."""
         cfg = self.cfg
-        # Random agent spawn positions
-        self.agent_pos = np.column_stack([
-            self.rng.randint(0, cfg.grid_width, size=cfg.n_agents),
-            self.rng.randint(0, cfg.grid_height, size=cfg.n_agents),
-        ]).astype(np.float64)
+        # Random agent spawn positions (on walkable cells)
+        agents = []
+        while len(agents) < cfg.n_agents:
+            ax = self.rng.randint(0, cfg.grid_width)
+            ay = self.rng.randint(0, cfg.grid_height)
+            if not self.obstacles[ay, ax]:
+                agents.append([ax, ay])
+        self.agent_pos = np.array(agents, dtype=np.float64)
 
-        # Random victim positions (non-overlapping with agents)
+        # Random victim positions (on walkable cells)
         victims = []
         while len(victims) < cfg.n_victims:
             vx = self.rng.randint(0, cfg.grid_width)
             vy = self.rng.randint(0, cfg.grid_height)
-            victims.append((vx, vy))
+            if self.obstacles[vy, vx]: continue
+            if not any(v[0] == vx and v[1] == vy for v in victims):
+                victims.append((vx, vy))
         self.victim_pos = np.array(victims, dtype=np.float64)
 
         self.victims_found = np.zeros(cfg.n_victims, dtype=bool)
@@ -63,12 +112,15 @@ class SAREnvironment:
         Returns: (observations, low_level_rewards, done, info)
         """
         cfg = self.cfg
-        # Move agents
+        # Move agents (respecting obstacles)
         for i, a in enumerate(actions):
             dx, dy = self.ACTION_MAP[int(a)]
             nx = np.clip(self.agent_pos[i, 0] + dx, 0, cfg.grid_width - 1)
             ny = np.clip(self.agent_pos[i, 1] + dy, 0, cfg.grid_height - 1)
-            self.agent_pos[i] = [nx, ny]
+            
+            # Can't walk into walls
+            if not self.obstacles[int(ny), int(nx)]:
+                self.agent_pos[i] = [nx, ny]
 
         # Belief update
         old_potential = self.belief.potential()
@@ -106,15 +158,31 @@ class SAREnvironment:
     def _get_observations(self) -> np.ndarray:
         """
         Returns obs array of shape (n_agents, obs_dim).
-        obs_i = [local_belief_flat, norm_x, norm_y]
+        obs_i = [local_belief_flat, local_obstacle_flat, norm_x, norm_y]
         """
         cfg = self.cfg
         obs_list = []
+        r = cfg.obs_radius
         for i in range(cfg.n_agents):
             x, y = int(self.agent_pos[i, 0]), int(self.agent_pos[i, 1])
-            local = self.belief.get_local_belief(x, y, cfg.obs_radius).flatten()
+            
+            # Local belief window
+            local_belief = self.belief.get_local_belief(x, y, r).flatten()
+            
+            # Local obstacle window
+            size = 2 * r + 1
+            local_obs = np.zeros((size, size), dtype=np.float32)
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    nx, ny = x + dx, y + dy
+                    # Out of bounds treated as walls
+                    if 0 <= nx < cfg.grid_width and 0 <= ny < cfg.grid_height:
+                        local_obs[dy + r, dx + r] = float(self.obstacles[ny, nx])
+                    else:
+                        local_obs[dy + r, dx + r] = 1.0  # Treat boundaries as obstacles
+            
             pos = np.array([x / cfg.grid_width, y / cfg.grid_height])
-            obs_list.append(np.concatenate([local, pos]))
+            obs_list.append(np.concatenate([local_belief, local_obs.flatten(), pos]))
         return np.array(obs_list, dtype=np.float32)
 
     # ── Helpers ──────────────────────────────────────────────────

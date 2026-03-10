@@ -15,17 +15,23 @@ class BeliefMap:
         self.width = width
         self.height = height
         self.n_victims = n_victims
-        # Prior: uniform probability
-        self.grid = np.full((height, width), n_victims / (width * height),
-                            dtype=np.float64)
+        # Prior: uniform probability (will be overridden by reset)
+        self.grid = np.zeros((height, width), dtype=np.float64)
         self._confirmed = np.zeros((height, width), dtype=bool)
+        self.obstacles = np.zeros((height, width), dtype=bool)
+        self.walkable_cells = width * height
+
+    def set_obstacles(self, obstacles: np.ndarray):
+        """Set fixed obstacles and compute walkable cell count."""
+        self.obstacles = obstacles.copy()
+        self.walkable_cells = int(np.sum(~self.obstacles))
 
     def reset(self, n_victims: int | None = None):
         if n_victims is not None:
             self.n_victims = n_victims
-        self.grid = np.full((self.height, self.width),
-                            self.n_victims / (self.width * self.height),
-                            dtype=np.float64)
+        # Uniform probability only over walkable cells
+        prior = self.n_victims / max(1, self.walkable_cells)
+        self.grid = np.where(self.obstacles, 0.0, prior).astype(np.float64)
         self._confirmed = np.zeros((self.height, self.width), dtype=bool)
 
     # ── Bayesian update ──────────────────────────────────────────

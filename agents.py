@@ -110,10 +110,10 @@ class HierarchicalMARLAgent:
         return rh
 
     # ══════════════════════════════════════════════════════════════
-    # PPO Updates
+    # Actor-Critic Updates
     # ══════════════════════════════════════════════════════════════
     def update(self):
-        """Run PPO updates for actor, critic, manager, and termination."""
+        """Run A2C updates for actor, critic, manager, and termination."""
         cfg = self.cfg
         buf = self.buffer
 
@@ -141,46 +141,41 @@ class HierarchicalMARLAgent:
         if ll_adv.numel() > 1:
             ll_adv = (ll_adv - ll_adv.mean()) / (ll_adv.std() + 1e-8)
 
-        # ── Low-level PPO (actor + critic) ───────────────────────
+        # ── Low-level Actor-Critic ───────────────────────────────────
         actor_losses, critic_losses = [], []
-        for _ in range(cfg.ppo_epochs):
-            for t in range(len(buf.obs)):
-                nf = buf.node_feats[t]
-                ei = buf.edge_indices[t]
-                ef = buf.edge_feats[t]
-                old_actions = torch.tensor(buf.actions[t], dtype=torch.long)
-                old_lp = torch.tensor(buf.log_probs[t], dtype=torch.float32)
+        # Single epoch over collected rollout data (A2C)
+        for t in range(len(buf.obs)):
+            nf = buf.node_feats[t]
+            ei = buf.edge_indices[t]
+            ef = buf.edge_feats[t]
+            old_actions = torch.tensor(buf.actions[t], dtype=torch.long)
+            # old_lp not needed for A2C surrogate directly (just compute new_lp and multiply by constant advantage)
 
-                # Actor
-                new_lp, ent = self.actor.evaluate(nf, ei, ef, old_actions)
-                ratio = torch.exp(new_lp - old_lp)    # (N,)
-                adv = ll_adv[t]
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - cfg.clip_eps,
-                                    1 + cfg.clip_eps) * adv
-                actor_loss = (-torch.min(surr1, surr2).mean()
-                              - cfg.entropy_coef * ent.mean())
+            # Actor
+            new_lp, ent = self.actor.evaluate(nf, ei, ef, old_actions)
+            adv = ll_adv[t]
+            actor_loss = -(new_lp * adv).mean() - cfg.entropy_coef * ent.mean()
 
-                self.opt_actor.zero_grad()
-                actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(),
-                                         cfg.max_grad_norm)
-                self.opt_actor.step()
-                actor_losses.append(actor_loss.item())
+            self.opt_actor.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                     cfg.max_grad_norm)
+            self.opt_actor.step()
+            actor_losses.append(actor_loss.item())
 
-                # Critic
-                value = self.critic(nf, ei, ef)
-                critic_loss = cfg.value_loss_coef * (value - ll_ret[t]) ** 2
-                critic_loss = critic_loss.mean()
+            # Critic
+            value = self.critic(nf, ei, ef)
+            critic_loss = cfg.value_loss_coef * (value - ll_ret[t]) ** 2
+            critic_loss = critic_loss.mean()
 
-                self.opt_critic.zero_grad()
-                critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.critic.parameters(),
-                                         cfg.max_grad_norm)
-                self.opt_critic.step()
-                critic_losses.append(critic_loss.item())
+            self.opt_critic.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(),
+                                     cfg.max_grad_norm)
+            self.opt_critic.step()
+            critic_losses.append(critic_loss.item())
 
-        # ── High-level PPO (manager) ─────────────────────────────
+        # ── High-level Actor-Critic (manager) ────────────────────────
         hl_adv, hl_ret = buf.compute_high_level_gae(
             0.0, cfg.gamma, cfg.gae_lambda)
 
@@ -190,29 +185,22 @@ class HierarchicalMARLAgent:
             if hl_adv_t.numel() > 1:
                 hl_adv_t = (hl_adv_t - hl_adv_t.mean()) / (hl_adv_t.std() + 1e-8)
 
-            for _ in range(cfg.ppo_epochs):
-                for t in range(len(buf.hl_obs)):
-                    obs_t = torch.tensor(buf.hl_obs[t], dtype=torch.float32)
-                    opt_t = torch.tensor(buf.hl_options[t], dtype=torch.long)
-                    old_lp = torch.tensor(buf.hl_log_probs[t],
-                                          dtype=torch.float32)
+            # Single epoch for A2C
+            for t in range(len(buf.hl_obs)):
+                obs_t = torch.tensor(buf.hl_obs[t], dtype=torch.float32)
+                opt_t = torch.tensor(buf.hl_options[t], dtype=torch.long)
 
-                    new_lp, ent = self.manager.evaluate(obs_t, opt_t)
-                    ratio = torch.exp(new_lp - old_lp)
-                    adv = hl_adv_t[t]
+                new_lp, ent = self.manager.evaluate(obs_t, opt_t)
+                adv = hl_adv_t[t]
 
-                    surr1 = ratio * adv
-                    surr2 = torch.clamp(ratio, 1 - cfg.clip_eps,
-                                        1 + cfg.clip_eps) * adv
-                    loss = (-torch.min(surr1, surr2).mean()
-                            - cfg.entropy_coef * ent.mean())
+                loss = -(new_lp * adv).mean() - cfg.entropy_coef * ent.mean()
 
-                    self.opt_manager.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.manager.parameters(),
-                                             cfg.max_grad_norm)
-                    self.opt_manager.step()
-                    manager_losses.append(loss.item())
+                self.opt_manager.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.manager.parameters(),
+                                         cfg.max_grad_norm)
+                self.opt_manager.step()
+                manager_losses.append(loss.item())
 
         # ── Termination loss: L_β = E[β · A^H] ──────────────────
         # Use the high-level advantage at each termination point
