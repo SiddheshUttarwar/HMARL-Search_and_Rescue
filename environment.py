@@ -78,16 +78,12 @@ class SAREnvironment:
     def reset(self) -> np.ndarray:
         """Generate a fresh random episode and return initial observations."""
         cfg = self.cfg
+        
+        # Determine all available non-obstacle cells
+        y_coords, x_coords = np.where(~self.obstacles)
+        walkable_coords = np.column_stack((x_coords, y_coords))
+        
         # Random agent spawn positions (on walkable cells)
-        agents = []
-        while len(agents) < cfg.n_agents:
-            ax = self.rng.randint(0, cfg.grid_width)
-            ay = self.rng.randint(0, cfg.grid_height)
-            if not self.obstacles[ay, ax]:
-                agents.append([ax, ay])
-        self.agent_pos = np.array(agents, dtype=np.float64)
-
-        # Random victim positions (on walkable cells)
         # Ensure agents don't spawn on the same cell
         agent_spawn_indices = self.rng.choice(len(walkable_coords), cfg.n_agents, replace=False)
         self.agent_pos = walkable_coords[agent_spawn_indices].astype(np.float64)
