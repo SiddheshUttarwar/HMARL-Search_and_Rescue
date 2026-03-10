@@ -532,6 +532,7 @@
     let totalCells, walkableCells;
     let step = 0, totalSwitches = 0;
     let playing = false, animId = null, lastFrame = 0;
+    let ws;
 
     // ═══════════════════════════════════════════════════════════════════
     // Initialisation
@@ -540,116 +541,113 @@
       canvas = document.getElementById('sim');
       ctx = canvas.getContext('2d');
       cellSize = canvas.width / CFG.gridW;
-      resetSim();
+
+      ws = new WebSocket('ws://127.0.0.1:8765');
+      ws.onopen = () => {
+        logEvent('Connected to PyTorch Simulation Server', 'log-form');
+        ws.send(JSON.stringify({ type: 'reset' }));
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'reset_state') {
+          handleResetState(data);
+        } else if (data.type === 'step_state') {
+          handleStepState(data);
+        } else if (data.type === 'done') {
+          logEvent('Episode finished/All victims rescued', 'log-found');
+          if (playing) togglePlay();
+        }
+      };
+
+      ws.onclose = () => {
+        logEvent('Disconnected from Server', 'log-explore');
+        if (playing) togglePlay();
+      };
+
       requestAnimationFrame(draw);
     }
 
     function resetSim() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'reset' }));
+      }
+    }
+
+    function handleResetState(data) {
       step = 0; totalSwitches = 0;
       document.getElementById('eventLog').innerHTML = '';
-      totalCells = CFG.gridW * CFG.gridH;
 
-      // Obstacle map — generate random walls & corridors
-      obstacles = [];
-      for (let y = 0; y < CFG.gridH; y++) {
-        obstacles[y] = new Array(CFG.gridW).fill(false);
-      }
-      generateObstacles();
+      CFG.gridW = data.gridW;
+      CFG.gridH = data.gridH;
+      totalCells = CFG.gridW * CFG.gridH;
       walkableCells = totalCells - CFG.nObstacles;
 
-      // Belief map — uniform prior (only over walkable cells)
-      belief = [];
-      for (let y = 0; y < CFG.gridH; y++) {
-        belief[y] = [];
-        for (let x = 0; x < CFG.gridW; x++) {
-          belief[y][x] = obstacles[y][x] ? 0 : CFG.nVictims / walkableCells;
-        }
-      }
+      obstacles = data.obstacles;
+      belief = data.belief;
+      victims = data.victims.map(v => ({ x: v.x, y: v.y, found: v.found, foundStep: -1 }));
 
-      // Coverage map — visit counts
+      agents = data.agents.map(a => ({
+        id: a.id, x: a.x, y: a.y,
+        option: a.option, optionAge: 0,
+        target: null, // target arrows omitted in server-sync mode intentionally
+        color: AGENT_COLORS[a.id % AGENT_COLORS.length],
+        trail: [{ x: a.x, y: a.y }]
+      }));
+
       coverage = [];
       for (let y = 0; y < CFG.gridH; y++) {
         coverage[y] = new Array(CFG.gridW).fill(0);
       }
-
-      // Random victim positions (not on obstacles)
-      victims = [];
-      while (victims.length < CFG.nVictims) {
-        const vx = Math.floor(Math.random() * CFG.gridW);
-        const vy = Math.floor(Math.random() * CFG.gridH);
-        if (obstacles[vy][vx]) continue;
-        if (!victims.some(v => v.x === vx && v.y === vy)) {
-          victims.push({ x: vx, y: vy, found: false, foundStep: -1 });
-        }
-      }
-
-      // Agents — spawn on walkable cells, spread out
-      agents = [];
-      for (let i = 0; i < CFG.nAgents; i++) {
-        let ax, ay;
-        do {
-          ax = Math.floor(Math.random() * CFG.gridW);
-          ay = Math.floor(Math.random() * CFG.gridH);
-        } while (obstacles[ay][ax]);
-        agents.push({
-          id: i, x: ax, y: ay,
-          option: OPTION.EXPLORE,
-          optionAge: 0,
-          target: null,
-          color: AGENT_COLORS[i % AGENT_COLORS.length],
-          trail: [],
-        });
-      }
-
-      // Mark initial agent positions as covered
       for (const a of agents) markCovered(a.x, a.y);
 
-      updateBeliefFromAgents();
       buildGraph();
-      logEvent('Mission started -- agents exploring around obstacles', 'log-explore');
+      logEvent('Environment Reset', 'log-explore');
       updateUI();
     }
 
-    const TRAINING_OBSTACLES = [
-      [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, true],
-      [false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, true, true, true],
-      [false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, true, false, false],
-      [false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, true, true, true, true, true],
-      [false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false],
-      [false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-      [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false],
-    ];
+    function handleStepState(data) {
+      step = data.step;
 
-    // ── Obstacle generation ─────────────────────────────────────
-    function generateObstacles() {
-      // Use the exact training environment layout (seed=42)
-      for (let y = 0; y < CFG.gridH; y++) {
-        for (let x = 0; x < CFG.gridW; x++) {
-          obstacles[y][x] = TRAINING_OBSTACLES[y][x];
+      for (let i = 0; i < CFG.nVictims; i++) {
+        if (!victims[i].found && data.victims[i].found) {
+          victims[i].found = true;
+          victims[i].foundStep = step;
+          logEvent(`!! VICTIM FOUND at (${victims[i].x},${victims[i].y}) at t=${step}`, 'log-found');
         }
+      }
+
+      for (let i = 0; i < CFG.nAgents; i++) {
+        const newA = data.agents[i];
+        const oldA = agents[i];
+
+        if (newA.option !== oldA.option) {
+          totalSwitches++;
+          logEvent(`A${oldA.id}: ${OPTION_NAME[oldA.option]} -> ${OPTION_NAME[newA.option]}`,
+            newA.option === 0 ? 'log-explore' : newA.option === 1 ? 'log-navigate' : 'log-form');
+        }
+
+        oldA.x = newA.x;
+        oldA.y = newA.y;
+        oldA.option = newA.option;
+
+        oldA.trail.push({ x: newA.x, y: newA.y });
+        if (oldA.trail.length > 30) oldA.trail.shift();
+
+        markCovered(oldA.x, oldA.y);
+      }
+
+      belief = data.belief;
+      buildGraph();
+      updateUI();
+
+      if (data.done) {
+        if (playing) togglePlay();
+        logEvent('Max steps reached or mission complete', 'log-explore');
       }
     }
 
-    function isBlocked(x, y) {
-      if (x < 0 || y < 0 || x >= CFG.gridW || y >= CFG.gridH) return true;
-      return obstacles[y][x];
-    }
-
     function markCovered(ax, ay) {
-      // Mark cells within detection radius as covered
       for (let dy = -CFG.detectionRadius; dy <= CFG.detectionRadius; dy++) {
         for (let dx = -CFG.detectionRadius; dx <= CFG.detectionRadius; dx++) {
           const nx = ax + dx, ny = ay + dy;
@@ -664,7 +662,7 @@
       let covered = 0, totalVisits = 0, overlapVisits = 0;
       for (let y = 0; y < CFG.gridH; y++) {
         for (let x = 0; x < CFG.gridW; x++) {
-          if (obstacles[y][x]) continue; // skip obstacles
+          if (obstacles[y][x]) continue;
           if (coverage[y][x] > 0) {
             covered++;
             totalVisits += coverage[y][x];
@@ -677,26 +675,6 @@
       return { covered, pct, overlap };
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Belief map
-    // ═══════════════════════════════════════════════════════════════════
-    function updateBeliefFromAgents() {
-      for (const a of agents) {
-        for (let dy = -CFG.detectionRadius; dy <= CFG.detectionRadius; dy++) {
-          for (let dx = -CFG.detectionRadius; dx <= CFG.detectionRadius; dx++) {
-            const nx = a.x + dx, ny = a.y + dy;
-            if (nx < 0 || ny < 0 || nx >= CFG.gridW || ny >= CFG.gridH) continue;
-            const hasVictim = victims.some(v => v.x === nx && v.y === ny && !v.found);
-            if (hasVictim) {
-              belief[ny][nx] = 1.0;
-            } else {
-              belief[ny][nx] = 0.0;
-            }
-          }
-        }
-      }
-    }
-
     function computeEntropy() {
       let H = 0;
       for (let y = 0; y < CFG.gridH; y++)
@@ -707,9 +685,6 @@
       return H;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Graph construction
-    // ═══════════════════════════════════════════════════════════════════
     function buildGraph() {
       edges = [];
       for (let i = 0; i < agents.length; i++) {
@@ -724,261 +699,6 @@
       }
     }
 
-    function getNeighbors(agentIdx) {
-      const nbrs = [];
-      for (const [i, j] of edges) {
-        if (i === agentIdx) nbrs.push(j);
-        if (j === agentIdx) nbrs.push(i);
-      }
-      return nbrs;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // High-level policy logic (simulated)
-    // ═══════════════════════════════════════════════════════════════════
-    function updateHighLevelPolicies() {
-      for (const a of agents) {
-        a.optionAge++;
-        const prevOption = a.option;
-
-        // Check if any victim is found and nearby
-        let nearestFoundVictim = null;
-        let nearestFoundDist = Infinity;
-        for (const v of victims) {
-          if (!v.found) continue;
-          const d = Math.sqrt((a.x - v.x) ** 2 + (a.y - v.y) ** 2);
-          if (d < nearestFoundDist) { nearestFoundDist = d; nearestFoundVictim = v; }
-        }
-
-        // Check if any unfound victim is detected (in belief)
-        let nearestDetected = null;
-        let nearestDetDist = Infinity;
-        for (const v of victims) {
-          if (v.found) continue;
-          if (belief[v.y][v.x] >= 0.99) {
-            const d = Math.sqrt((a.x - v.x) ** 2 + (a.y - v.y) ** 2);
-            if (d < nearestDetDist) { nearestDetDist = d; nearestDetected = v; }
-          }
-        }
-
-        // Termination check (graph-conditioned)
-        const shouldTerminate = a.optionAge >= CFG.kMax ||
-          (a.optionAge >= CFG.kMin && decideTermination(a));
-
-        if (shouldTerminate) {
-          // Decide new option based on state
-          if (nearestDetected && nearestDetDist > 2) {
-            // Navigate to detected but unfound victim
-            a.option = OPTION.NAVIGATE;
-            a.target = { x: nearestDetected.x, y: nearestDetected.y };
-          } else if (nearestDetected && nearestDetDist <= 2) {
-            // Close to victim → Form
-            a.option = OPTION.FORM;
-            a.target = { x: nearestDetected.x, y: nearestDetected.y };
-          } else if (nearestFoundVictim && nearestFoundDist <= 4) {
-            // Near a found victim — spread out to explore more
-            a.option = OPTION.EXPLORE;
-            a.target = null;
-          } else {
-            a.option = OPTION.EXPLORE;
-            a.target = null;
-          }
-
-          // Propagate through graph: neighbors adopt Navigate if victim detected
-          if (a.option === OPTION.NAVIGATE || a.option === OPTION.FORM) {
-            const nbrs = getNeighbors(a.id);
-            for (const ni of nbrs) {
-              const nb = agents[ni];
-              if (nb.option === OPTION.EXPLORE && nearestDetected) {
-                nb.option = OPTION.NAVIGATE;
-                nb.target = { x: nearestDetected.x, y: nearestDetected.y };
-                nb.optionAge = 0;
-                totalSwitches++;
-                logEvent(`A${nb.id} switched to Navigate (graph signal from A${a.id})`, 'log-navigate');
-              }
-            }
-          }
-
-          if (a.option !== prevOption) {
-            totalSwitches++;
-            a.optionAge = 0;
-            logEvent(`A${a.id}: ${OPTION_NAME[prevOption]} -> ${OPTION_NAME[a.option]}`,
-              a.option === 0 ? 'log-explore' : a.option === 1 ? 'log-navigate' : 'log-form');
-          }
-        }
-      }
-    }
-
-    function decideTermination(agent) {
-      // Simulated graph-conditioned termination
-      const nbrs = getNeighbors(agent.id);
-      // Higher termination probability if neighbors have different options
-      let diffCount = 0;
-      for (const ni of nbrs) {
-        if (agents[ni].option !== agent.option) diffCount++;
-      }
-      const baseBeta = 0.08;
-      const graphBonus = nbrs.length > 0 ? 0.15 * (diffCount / nbrs.length) : 0;
-      return Math.random() < (baseBeta + graphBonus);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Low-level movement
-    // ═══════════════════════════════════════════════════════════════════
-    function moveAgents() {
-      for (const a of agents) {
-        let dx = 0, dy = 0;
-
-        if (a.option === OPTION.EXPLORE) {
-          // ── Coverage-maximizing exploration ──
-          // Score each direction: prefer uncovered cells, avoid overlap,
-          // repel from other exploring agents to spread out.
-          dx = 0; dy = 0;
-          let bestScore = -Infinity;
-          const dirs = [[0, -1], [0, 1], [-1, 0], [1, 0], [0, 0]];
-          for (const [ddx, ddy] of dirs) {
-            const nx = a.x + ddx, ny = a.y + ddy;
-            if (isBlocked(nx, ny)) continue;  // obstacle-aware: skip blocked cells
-
-            // Prefer uncovered cells (high belief = unexplored)
-            let score = belief[ny][nx] * 3.0;
-
-            // Penalize already-covered cells (coverage overlap penalty)
-            score -= coverage[ny][nx] * 0.8;
-
-            // Bonus for being adjacent to obstacles (explore edges of walls)
-            for (const [odx, ody] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
-              if (isBlocked(nx + odx, ny + ody)) { score += 0.15; break; }
-            }
-
-            // Repel from other exploring agents (spread out for max coverage)
-            for (const other of agents) {
-              if (other.id === a.id) continue;
-              if (other.option !== OPTION.EXPLORE) continue;
-              const od = Math.sqrt((nx - other.x) ** 2 + (ny - other.y) ** 2);
-              if (od < 4) score += od * 0.4;  // reward distance from others
-            }
-
-            // Small randomness for tie-breaking
-            score += Math.random() * 0.2;
-
-            if (score > bestScore) { bestScore = score; dx = ddx; dy = ddy; }
-          }
-        } else if (a.option === OPTION.NAVIGATE && a.target) {
-          // Navigate toward target victim — obstacle-aware
-          const tdx = a.target.x - a.x;
-          const tdy = a.target.y - a.y;
-          // Try primary direction first; if blocked, try alternate
-          let moved = false;
-          if (Math.abs(tdx) > Math.abs(tdy)) {
-            if (!isBlocked(a.x + Math.sign(tdx), a.y)) { dx = Math.sign(tdx); moved = true; }
-            else if (tdy !== 0 && !isBlocked(a.x, a.y + Math.sign(tdy))) { dy = Math.sign(tdy); moved = true; }
-          } else {
-            if (tdy !== 0 && !isBlocked(a.x, a.y + Math.sign(tdy))) { dy = Math.sign(tdy); moved = true; }
-            else if (tdx !== 0 && !isBlocked(a.x + Math.sign(tdx), a.y)) { dx = Math.sign(tdx); moved = true; }
-          }
-          // Wall-following fallback: try perpendicular directions
-          if (!moved) {
-            const alts = [[0, 1], [0, -1], [1, 0], [-1, 0]];
-            for (const [adx, ady] of alts) {
-              if (!isBlocked(a.x + adx, a.y + ady)) { dx = adx; dy = ady; break; }
-            }
-          }
-        } else if (a.option === OPTION.FORM && a.target) {
-          // Form: move toward target — obstacle-aware
-          const dist = Math.sqrt((a.x - a.target.x) ** 2 + (a.y - a.target.y) ** 2);
-          if (dist > 1.5) {
-            const tdx = a.target.x - a.x;
-            const tdy = a.target.y - a.y;
-            if (Math.abs(tdx) >= Math.abs(tdy)) {
-              if (!isBlocked(a.x + Math.sign(tdx), a.y)) dx = Math.sign(tdx);
-              else if (!isBlocked(a.x, a.y + Math.sign(tdy || 1))) dy = Math.sign(tdy || 1);
-            } else {
-              if (!isBlocked(a.x, a.y + Math.sign(tdy))) dy = Math.sign(tdy);
-              else if (!isBlocked(a.x + Math.sign(tdx || 1), a.y)) dx = Math.sign(tdx || 1);
-            }
-          } else {
-            // Hold position / circle — avoid obstacles
-            const angle = (a.id / CFG.nAgents) * Math.PI * 2 + step * 0.1;
-            const cdx = Math.round(Math.cos(angle));
-            const cdy = Math.round(Math.sin(angle));
-            if (!isBlocked(a.x + cdx, a.y + cdy)) { dx = cdx; dy = cdy; }
-          }
-        }
-
-        // Clamp and update position (final obstacle check)
-        a.trail.push({ x: a.x, y: a.y });
-        if (a.trail.length > 30) a.trail.shift();
-        const newX = Math.max(0, Math.min(CFG.gridW - 1, a.x + dx));
-        const newY = Math.max(0, Math.min(CFG.gridH - 1, a.y + dy));
-        if (!obstacles[newY][newX]) {
-          a.x = newX;
-          a.y = newY;
-        }
-
-        // Update coverage map
-        markCovered(a.x, a.y);
-      }
-    }
-    // ═══════════════════════════════════════════════════════════════════
-    // Simulation step
-    // ═══════════════════════════════════════════════════════════════════
-    function simStep() {
-      if (step >= CFG.maxSteps || victims.filter(v => v.found).length === CFG.nVictims) {
-        if (playing) togglePlay();
-        return;
-      }
-      step++;
-
-      moveAgents();
-      updateBeliefFromAgents();
-      buildGraph();
-      updateHighLevelPolicies();
-
-      // 3) Victim detection (immediate reaction)
-      for (const v of victims) {
-        if (v.found) continue;
-        for (const a of agents) {
-          const d = Math.sqrt((a.x - v.x) ** 2 + (a.y - v.y) ** 2);
-          if (d <= CFG.detectionRadius) {
-            v.found = true;
-            v.foundStep = step;
-            logEvent(`!! VICTIM FOUND at (${v.x},${v.y}) by A${a.id} at t=${step}`, 'log-found');
-
-            // Immediately signal neighbors to Navigate/Form
-            a.option = OPTION.FORM;
-            a.target = { x: v.x, y: v.y };
-            a.optionAge = 0;
-            totalSwitches++;
-            logEvent(`A${a.id} switched to Form (first responder)`, 'log-form');
-
-            const nbrs = getNeighbors(a.id);
-            for (const ni of nbrs) {
-              const nb = agents[ni];
-              if (nb.option !== OPTION.FORM) {
-                nb.option = OPTION.NAVIGATE;
-                nb.target = { x: v.x, y: v.y };
-                nb.optionAge = 0;
-                totalSwitches++;
-                logEvent(`A${nb.id} switched to Navigate (graph-conditioned from A${a.id})`, 'log-navigate');
-              }
-            }
-            break;
-          }
-        }
-      }
-
-      updateUI();
-
-      if (victims.every(v => v.found) && step > 10) {
-        logEvent(`ALL VICTIMS RESCUED at t=${step}!`, 'log-found');
-        if (playing) togglePlay();
-      }
-      if (step >= CFG.maxSteps) {
-        logEvent(`Max steps reached (${CFG.maxSteps})`, 'log-explore');
-        if (playing) togglePlay();
-      }
-    }
     // ═══════════════════════════════════════════════════════════════════
     // Drawing
     // ═══════════════════════════════════════════════════════════════════
@@ -993,16 +713,15 @@
         const interval = 1000 / speed;
         if (timestamp - lastFrame >= interval) {
           lastFrame = timestamp;
-          simStep();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'step' }));
+          }
         }
-      }
-
-      const W = canvas.width, H = canvas.height;
+      } const W = canvas.width, H = canvas.height;
       ctx.clearRect(0, 0, W, H);
 
       // Background
       ctx.fillStyle = '#0d1117';
-      ctx.fillRect(0, 0, W, H);
 
       // Coverage heatmap (green tint for explored cells)
       for (let y = 0; y < CFG.gridH; y++) {
@@ -1232,7 +951,9 @@
 
     function stepOnce() {
       if (playing) togglePlay();
-      simStep();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'step' }));
+      }
     }
 
     // ── Start ───────────────────────────────────────────────────
