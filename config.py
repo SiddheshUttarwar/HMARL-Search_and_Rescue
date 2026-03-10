@@ -3,7 +3,7 @@ Configuration for Hierarchical MARL SAR framework.
 All hyperparameters in one place.
 """
 import sys
-sys.path.insert(0, r"D:\torch_pkg")
+# sys.path.insert(0, r"D:\torch_pkg")
 
 from dataclasses import dataclass, field
 from typing import List
