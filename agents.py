@@ -6,6 +6,7 @@ Runs PPO updates for all four networks.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 
@@ -137,75 +138,82 @@ class HierarchicalMARLAgent:
 
         ll_adv = torch.tensor(ll_adv, dtype=torch.float32)
         ll_ret = torch.tensor(ll_ret, dtype=torch.float32)
-        # Normalise advantages
+        # Normalise advantages across the batch
         if ll_adv.numel() > 1:
             ll_adv = (ll_adv - ll_adv.mean()) / (ll_adv.std() + 1e-8)
 
         # ── Low-level Actor-Critic ───────────────────────────────────
-        actor_losses, critic_losses = [], []
-        # Single epoch over collected rollout data (A2C)
+        actor_loss_seq = []
+        critic_loss_seq = []
+        
+        # Accumulate loss over the whole rollout buffer (batched A2C)
         for t in range(len(buf.obs)):
             nf = buf.node_feats[t]
             ei = buf.edge_indices[t]
             ef = buf.edge_feats[t]
             old_actions = torch.tensor(buf.actions[t], dtype=torch.long)
-            # old_lp not needed for A2C surrogate directly (just compute new_lp and multiply by constant advantage)
 
             # Actor
             new_lp, ent = self.actor.evaluate(nf, ei, ef, old_actions)
-            adv = ll_adv[t]
-            actor_loss = -(new_lp * adv).mean() - cfg.entropy_coef * ent.mean()
-
-            self.opt_actor.zero_grad()
-            actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(),
-                                     cfg.max_grad_norm)
-            self.opt_actor.step()
-            actor_losses.append(actor_loss.item())
+            # adv is shape scalar for this timestep (from global critic), but new_lp is N
+            adv = ll_adv[t].unsqueeze(0).expand_as(new_lp)
+            
+            # Policy gradient = E[ -log_prob * A ] - entropy_bonus
+            act_l = -(new_lp * adv).mean() - cfg.entropy_coef * ent.mean()
+            actor_loss_seq.append(act_l)
 
             # Critic
             value = self.critic(nf, ei, ef)
-            critic_loss = cfg.value_loss_coef * (value - ll_ret[t]) ** 2
-            critic_loss = critic_loss.mean()
+            crit_l = cfg.value_loss_coef * F.mse_loss(value, ll_ret[t].unsqueeze(0))
+            critic_loss_seq.append(crit_l)
 
-            self.opt_critic.zero_grad()
-            critic_loss.backward()
-            nn.utils.clip_grad_norm_(self.critic.parameters(),
-                                     cfg.max_grad_norm)
-            self.opt_critic.step()
-            critic_losses.append(critic_loss.item())
+        # Average over the sequence and perform ONE gradient step
+        actor_loss = torch.stack(actor_loss_seq).mean()
+        self.opt_actor.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.max_grad_norm)
+        self.opt_actor.step()
+
+        critic_loss = torch.stack(critic_loss_seq).mean()
+        self.opt_critic.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.max_grad_norm)
+        self.opt_critic.step()
 
         # ── High-level Actor-Critic (manager) ────────────────────────
-        hl_adv, hl_ret = buf.compute_high_level_gae(
-            0.0, cfg.gamma, cfg.gae_lambda)
+        hl_adv, hl_ret = buf.compute_high_level_gae(0.0, cfg.gamma, cfg.gae_lambda)
 
-        manager_losses = []
+        manager_loss_val = 0.0
         if len(hl_adv) > 0:
             hl_adv_t = torch.tensor(hl_adv, dtype=torch.float32)
             if hl_adv_t.numel() > 1:
                 hl_adv_t = (hl_adv_t - hl_adv_t.mean()) / (hl_adv_t.std() + 1e-8)
 
-            # Single epoch for A2C
+            manager_loss_seq = []
+            # Accumulate loss over the whole rollout buffer
             for t in range(len(buf.hl_obs)):
                 obs_t = torch.tensor(buf.hl_obs[t], dtype=torch.float32)
                 opt_t = torch.tensor(buf.hl_options[t], dtype=torch.long)
 
                 new_lp, ent = self.manager.evaluate(obs_t, opt_t)
-                adv = hl_adv_t[t]
+                adv = hl_adv_t[t].unsqueeze(0).expand_as(new_lp)
 
                 loss = -(new_lp * adv).mean() - cfg.entropy_coef * ent.mean()
+                manager_loss_seq.append(loss)
 
-                self.opt_manager.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.manager.parameters(),
-                                         cfg.max_grad_norm)
-                self.opt_manager.step()
-                manager_losses.append(loss.item())
+            # One gradient step
+            manager_loss = torch.stack(manager_loss_seq).mean()
+            self.opt_manager.zero_grad()
+            manager_loss.backward()
+            nn.utils.clip_grad_norm_(self.manager.parameters(), cfg.max_grad_norm)
+            self.opt_manager.step()
+            manager_loss_val = manager_loss.item()
 
         # ── Termination loss: L_β = E[β · A^H] ──────────────────
         # Use the high-level advantage at each termination point
-        term_losses = []
+        term_loss_val = 0.0
         if len(hl_adv) > 0:
+            term_loss_seq = []
             for t in range(len(buf.hl_obs)):
                 obs_t = torch.tensor(buf.hl_obs[t], dtype=torch.float32)
                 # Rebuild graph for termination net
@@ -221,20 +229,21 @@ class HierarchicalMARLAgent:
                 ef = torch.zeros((0, 3), dtype=torch.float32)
 
                 beta = self.termination(nf, ei, ef)   # (N,)
-                adv = hl_adv_t[t] if len(hl_adv) > 0 else torch.tensor(0.0)
+                adv = hl_adv_t[t].unsqueeze(0).expand_as(beta) if len(hl_adv) > 0 else torch.zeros_like(beta)
                 t_loss = (beta * adv).mean()
+                term_loss_seq.append(t_loss)
 
-                self.opt_term.zero_grad()
-                t_loss.backward()
-                nn.utils.clip_grad_norm_(self.termination.parameters(),
-                                         cfg.max_grad_norm)
-                self.opt_term.step()
-                term_losses.append(t_loss.item())
+            term_loss = torch.stack(term_loss_seq).mean()
+            self.opt_term.zero_grad()
+            term_loss.backward()
+            nn.utils.clip_grad_norm_(self.termination.parameters(), cfg.max_grad_norm)
+            self.opt_term.step()
+            term_loss_val = term_loss.item()
 
         self.buffer.clear()
         return {
-            "actor_loss": np.mean(actor_losses) if actor_losses else 0.0,
-            "critic_loss": np.mean(critic_losses) if critic_losses else 0.0,
-            "manager_loss": np.mean(manager_losses) if manager_losses else 0.0,
-            "term_loss": np.mean(term_losses) if term_losses else 0.0,
+            "actor_loss": actor_loss.item() if len(actor_loss_seq) > 0 else 0.0,
+            "critic_loss": critic_loss.item() if len(critic_loss_seq) > 0 else 0.0,
+            "manager_loss": manager_loss_val,
+            "term_loss": term_loss_val,
         }
