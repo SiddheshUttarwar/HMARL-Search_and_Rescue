@@ -436,6 +436,7 @@
           <button class="btn" id="btnStep" onclick="stepOnce()">Step</button>
           <button class="btn reset" onclick="resetSim()">Reset</button>
         </div>
+
         <div class="speed-row">
           <label>Speed</label>
           <input type="range" id="speed" min="1" max="20" value="6">
@@ -531,6 +532,10 @@
     let totalCells, walkableCells;
     let step = 0, totalSwitches = 0;
     let playing = false, animId = null, lastFrame = 0;
+
+    // Playback Data (Injected by Python)
+    let playbackData = window.playbackData || null;
+    let isPlayback = !!playbackData;
 
     // ═══════════════════════════════════════════════════════════════════
     // Initialisation
@@ -1233,13 +1238,140 @@
       btn.classList.toggle('active', playing);
     }
 
-    function stepOnce() {
-      if (playing) togglePlay();
-      simStep();
+    // ── Start ───────────────────────────────────────────────────
+    window.addEventListener('DOMContentLoaded', () => {
+      // Auto-load if Python injected data
+      if (isPlayback) {
+        try {
+          // Override Config
+          CFG.gridW = playbackData.config.gridW;
+          CFG.gridH = playbackData.config.gridH;
+          CFG.nAgents = playbackData.config.nAgents;
+          CFG.nVictims = playbackData.config.nVictims;
+          CFG.nObstacles = playbackData.config.nObstacles;
+
+          canvas = document.getElementById('sim');
+          ctx = canvas.getContext('2d');
+          cellSize = canvas.width / CFG.gridW;
+
+          // Set static environment
+          obstacles = playbackData.obstacles;
+          victims = playbackData.victims;
+          totalCells = CFG.gridW * CFG.gridH;
+          walkableCells = totalCells - CFG.nObstacles;
+
+          // Setup agents array
+          agents = [];
+          for (let i = 0; i < CFG.nAgents; i++) {
+            agents.push({
+              id: i, x: 0, y: 0, option: 0, target: null,
+              color: AGENT_COLORS[i % AGENT_COLORS.length], trail: []
+            });
+          }
+
+          // Coverage map
+          coverage = [];
+          for (let y = 0; y < CFG.gridH; y++) coverage[y] = new Array(CFG.gridW).fill(0);
+
+          step = 0;
+          totalSwitches = 0;
+          document.getElementById('eventLog').innerHTML = '';
+          logEvent("Loaded PyTorch Trajectory successfully.", "log-found");
+
+          requestAnimationFrame(draw);
+          loadFrame(0);
+
+        } catch (err) {
+          alert("Error parsing embedded JSON: " + err);
+        }
+      } else {
+        init();
+      }
+    });
+
+    function loadFrame(frameIdx) {
+      if (!isPlayback || !playbackData || frameIdx >= playbackData.frames.length) {
+        playing = false;
+        document.getElementById('btnPlay').textContent = '▶ Play';
+        document.getElementById('btnPlay').classList.remove('active');
+        logEvent('End of PyTorch playback.');
+        return;
+      }
+
+      const frame = playbackData.frames[frameIdx];
+      step = frame.step;
+      totalSwitches = frame.switches;
+      belief = frame.belief;
+
+      // Update victims
+      for (let i = 0; i < CFG.nVictims; i++) {
+        if (!victims[i].found && frame.victims_found[i]) {
+          victims[i].found = true;
+          victims[i].foundStep = step;
+          logEvent(`Victim found at (${victims[i].x},${victims[i].y})!`, 'log-found');
+        }
+      }
+
+      // Update agents
+      for (let i = 0; i < CFG.nAgents; i++) {
+        const fa = frame.agents[i];
+
+        // Log option switches
+        if (frameIdx > 0 && agents[i].option !== fa.option) {
+          logEvent(`A${i} switched to ${OPTION_NAME[fa.option]}`, OPTION_CLASS[fa.option].replace('opt-', 'log-'));
+        }
+
+        agents[i].x = fa.x;
+        agents[i].y = fa.y;
+        agents[i].option = fa.option;
+        coverage[fa.y][fa.x]++;
+      }
+
+      edges = buildProximityGraph();
+
+      // Override DOM metrics cleanly
+      updateUI();
+      document.getElementById('sEntropy').textContent = frame.entropy.toFixed(1);
+      document.getElementById('sPotential').textContent = frame.potential.toFixed(1);
+
+      draw();
     }
 
-    // ── Start ───────────────────────────────────────────────────
-    window.addEventListener('DOMContentLoaded', init);
+    function simStep() {
+      if (isPlayback) {
+        loadFrame(step + 1);
+        return;
+      }
+      // Or fallback to the original simulation logic
+      if (step >= CFG.maxSteps || victims.filter(v => v.found).length === CFG.nVictims) {
+        if (playing) togglePlay();
+        return;
+      }
+      step++;
+
+      // 1) Agent decision & movement
+      for (let i = 0; i < CFG.nAgents; i++) {
+        const a = agents[i];
+        updateAgentOption(a);
+        takeAction(a);
+
+        a.trail.push({ x: a.x, y: a.y });
+        if (a.trail.length > 10) a.trail.shift();
+        coverage[a.y][a.x]++;
+      }
+
+      // 2) Graph updates
+      edges = buildProximityGraph();
+
+      // 3) Victim detection
+      checkVictims();
+
+      // 4) Belief update
+      updateBelief();
+
+      updateUI();
+      draw();
+    }
   </script>
 </body>
 
