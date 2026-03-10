@@ -34,7 +34,7 @@ class Config:
     obs_dim: int = 0                  # set dynamically after env init
     node_feat_dim: int = 0            # obs_dim + n_options (one-hot)
     edge_feat_dim: int = 3            # [dx, dy, dist]
-    hidden_dim: int = 64
+    hidden_dim: int = 128
     action_dim: int = 5               # {up, down, left, right, stay}
 
     # ── Actor-Critic ─────────────────────────────────────────────
@@ -51,7 +51,7 @@ class Config:
 
     # ── Reward shaping ───────────────────────────────────────────
     lambda_time: float = 0.01        # time penalty weight
-    lambda_switch: float = 0.05      # switching penalty weight
+    lambda_switch: float = 0.1      # switching penalty weight
     w_explore: float = 1.0           # exploration potential weight
     w_navigate: float = 0.5          # navigation potential weight
     w_formation: float = 0.3         # formation potential weight

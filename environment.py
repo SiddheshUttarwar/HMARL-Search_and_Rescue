@@ -88,18 +88,33 @@ class SAREnvironment:
         self.agent_pos = np.array(agents, dtype=np.float64)
 
         # Random victim positions (on walkable cells)
-        victims = []
-        while len(victims) < cfg.n_victims:
-            vx = self.rng.randint(0, cfg.grid_width)
-            vy = self.rng.randint(0, cfg.grid_height)
-            if self.obstacles[vy, vx]: continue
-            if not any(v[0] == vx and v[1] == vy for v in victims):
-                victims.append((vx, vy))
-        self.victim_pos = np.array(victims, dtype=np.float64)
+        # Ensure agents don't spawn on the same cell
+        agent_spawn_indices = self.rng.choice(len(walkable_coords), cfg.n_agents, replace=False)
+        self.agent_pos = walkable_coords[agent_spawn_indices].astype(np.float64)
+
+        # Random victim positions (on walkable cells), not on agent spawn positions
+        victim_spawn_indices = []
+        available_coords_for_victims = np.array([
+            coord for i, coord in enumerate(walkable_coords)
+            if i not in agent_spawn_indices
+        ])
+        
+        if len(available_coords_for_victims) < cfg.n_victims:
+            raise ValueError("Not enough walkable cells for victims after placing agents.")
+
+        victim_spawn_indices = self.rng.choice(len(available_coords_for_victims), cfg.n_victims, replace=False)
+        self.victim_pos = available_coords_for_victims[victim_spawn_indices].astype(np.float64)
 
         self.victims_found = np.zeros(cfg.n_victims, dtype=bool)
         self.step_count = 0
         self.belief.reset(cfg.n_victims)
+
+        # Track visited cells explicitly for overlap penalty
+        self.visited = np.zeros((cfg.grid_height, cfg.grid_width), dtype=bool)
+        for i in range(cfg.n_agents):
+            # Convert agent_pos to int for indexing
+            ax, ay = int(self.agent_pos[i, 0]), int(self.agent_pos[i, 1])
+            self.visited[ay, ax] = True
 
         # Initial belief update based on spawn positions
         self.belief.update(self.agent_pos, self.victim_pos, cfg.detection_radius)
@@ -141,10 +156,17 @@ class SAREnvironment:
         done = bool(np.all(self.victims_found) or
                      self.step_count >= cfg.max_episode_steps)
 
-        # Low-level reward: small per-agent entropy reduction share
+        # Low-level reward: small per-agent entropy reduction share - overlap penalty
         reward_per_agent = np.full(cfg.n_agents,
                                    (new_potential - old_potential) / cfg.n_agents,
                                    dtype=np.float64)
+                                   
+        # Apply coverage overlap penalty
+        for i in range(cfg.n_agents):
+            ax, ay = int(self.agent_pos[i, 0]), int(self.agent_pos[i, 1])
+            if self.visited[ay, ax]:
+                reward_per_agent[i] -= 0.05   # Small penalty for revisiting
+            self.visited[ay, ax] = True
 
         info = {
             "potential": new_potential,
